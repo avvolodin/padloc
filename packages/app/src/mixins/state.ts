@@ -5,6 +5,10 @@ type Constructor<T> = new (...args: any[]) => T;
 
 export const StateMixin = <T extends Constructor<BaseElement>>(baseElement: T) =>
     class extends baseElement {
+        get app() {
+            return app;
+        }
+
         get state() {
             return app.state;
         }
@@ -12,9 +16,7 @@ export const StateMixin = <T extends Constructor<BaseElement>>(baseElement: T) =
         _stateHandler = this.stateChanged.bind(this);
 
         connectedCallback() {
-            if (super.connectedCallback) {
-                super.connectedCallback();
-            }
+            super.connectedCallback();
 
             app.subscribe(this._stateHandler);
             this.stateChanged();
@@ -23,9 +25,7 @@ export const StateMixin = <T extends Constructor<BaseElement>>(baseElement: T) =
         disconnectedCallback() {
             app.unsubscribe(this._stateHandler);
 
-            if (super.disconnectedCallback) {
-                super.disconnectedCallback();
-            }
+            super.disconnectedCallback();
         }
 
         /**

@@ -161,12 +161,7 @@ export class VaultDialog extends Dialog<InputType, void> {
     // }
 
     private async _save() {
-        if (this._saveButton.state === "loading") {
-            return;
-        }
-
         this._error = "";
-        this._saveButton.start();
 
         const groups = [...this._groups.entries()]
             .filter(([, { read }]) => read)
@@ -176,9 +171,20 @@ export class VaultDialog extends Dialog<InputType, void> {
             .filter(([, { read }]) => read)
             .map(([id, { write }]) => ({ id, readonly: !write }));
 
+        if (!members.length && !groups.length) {
+            this._error = "You have to assign at least one member or group!";
+            return;
+        }
+
+        if (this._saveButton.state === "loading") {
+            return;
+        }
+
+        this._saveButton.start();
+
         try {
             if (this.vault) {
-                await app.updateVault(this.org!.id, this.vault.id, this._nameInput.value, members, groups);
+                await app.updateVaultAccess(this.org!.id, this.vault.id, this._nameInput.value, members, groups);
             } else {
                 await app.createVault(this._nameInput.value, this.org!, members, groups);
             }
@@ -280,7 +286,6 @@ export class VaultDialog extends Dialog<InputType, void> {
     renderContent() {
         const org = this.org!;
         const isAdmin = org.isAdmin(app.account!);
-        const isOwner = org.isOwner(app.account!);
 
         const filter = this._filterString.toLowerCase();
 
@@ -305,7 +310,7 @@ export class VaultDialog extends Dialog<InputType, void> {
                 <pl-icon
                     icon="delete"
                     class="delete-button tap"
-                    ?hidden=${!isOwner}
+                    ?hidden=${!isAdmin || !this.vault}
                     @click=${this._deleteVault}
                 ></pl-icon>
             </header>
@@ -366,18 +371,22 @@ export class VaultDialog extends Dialog<InputType, void> {
                 <div class="error item" ?hidden="${!this._error}">
                     ${this._error}
                 </div>
+            </div>
 
-                <div class="actions" ?hidden=${!isAdmin}>
+            <div class="footer">
+                <div class="actions">
                     <pl-loading-button
                         class="tap primary"
                         id="saveButton"
-                        ?disabled=${!this._hasChanged}
+                        ?disabled=${!isAdmin || !this._hasChanged}
                         @click=${this._save}
                     >
-                        ${$l("Save")}
+                        ${this.vault ? $l("Save") : $l("Create Vault")}
                     </pl-loading-button>
 
-                    <button class="tap" @click=${this.dismiss}>${$l("Cancel")}</button>
+                    <button class="transparent tap" @click=${this.dismiss}>
+                        ${this._hasChanged ? $l("Cancel") : $l("Close")}
+                    </button>
                 </div>
             </div>
         `;

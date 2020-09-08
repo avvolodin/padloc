@@ -2,6 +2,7 @@ import "../../assets/fonts/fonts.css";
 import { Plan, PlanType } from "@padloc/core/src/billing";
 import { translate as $l } from "@padloc/locale/src/translate";
 import { biometricAuth } from "@padloc/core/src/platform";
+import { VaultItem } from "@padloc/core/src/item";
 import { config, shared, mixins } from "../styles";
 import { app, router } from "../globals";
 import { StateMixin } from "../mixins/state";
@@ -28,20 +29,23 @@ import { CreateOrgDialog } from "./create-org-dialog";
 import { ChoosePlanDialog } from "./choose-plan-dialog";
 import { PremiumDialog } from "./premium-dialog";
 import { CreateItemDialog } from "./create-item-dialog";
-import { TemplateDialog } from "./template-dialog";
+import { TOTPElement } from "./totp";
 
-// const cordovaReady = new Promise(resolve => {
-//     document.addEventListener("deviceready", resolve);
-// });
-
-class App extends ServiceWorker(StateMixin(AutoSync(ErrorHandling(AutoLock(BaseElement))))) {
+export class App extends ServiceWorker(StateMixin(AutoSync(ErrorHandling(AutoLock(BaseElement))))) {
     @property()
     locked = true;
     @property()
     loggedIn = false;
 
+    @property({ type: Boolean, reflect: true, attribute: "singleton-container" })
+    readonly singletonContainer = true;
+
+    get router() {
+        return router;
+    }
+
     @property()
-    private _ready = false;
+    protected _ready = false;
 
     @query("pl-start")
     private _startView: Start;
@@ -74,9 +78,6 @@ class App extends ServiceWorker(StateMixin(AutoSync(ErrorHandling(AutoLock(BaseE
     @dialog("pl-create-item-dialog")
     private _createItemDialog: CreateItemDialog;
 
-    @dialog("pl-template-dialog")
-    private _templateDialog: TemplateDialog;
-
     @property()
     private _view: View | null;
 
@@ -94,6 +95,10 @@ class App extends ServiceWorker(StateMixin(AutoSync(ErrorHandling(AutoLock(BaseE
 
     async load() {
         await app.loaded;
+        // Try syncing account so user can unlock with new password in case it has changed
+        if (app.state.loggedIn) {
+            app.fetchAccount();
+        }
         this._ready = true;
         this._routeChanged();
         const spinner = document.querySelector(".spinner") as HTMLElement;
@@ -318,18 +323,48 @@ class App extends ServiceWorker(StateMixin(AutoSync(ErrorHandling(AutoLock(BaseE
     updated(changes: Map<string, any>) {
         if (changes.has("locked")) {
             if (this.locked) {
-                this.$(".wrapper").classList.remove("active");
-                clearDialogs();
-                clearClipboard();
-                this._routeChanged();
+                this._locked();
             } else {
-                setTimeout(() => {
-                    this.$(".wrapper").classList.add("active");
-                    router.go(router.params.next || "", {}, true);
-                }, 600);
+                this._unlocked();
+            }
+        }
+
+        if (changes.has("loggedIn")) {
+            if (this.loggedIn) {
+                this._loggedIn();
+            } else {
+                this._loggedOut();
             }
         }
     }
+
+    protected _locked() {
+        this.$(".wrapper").classList.remove("active");
+        clearDialogs();
+        clearClipboard();
+        this._routeChanged();
+    }
+
+    protected _unlocked(instant = false) {
+        setTimeout(
+            async () => {
+                if (!this.$(".wrapper")) {
+                    await this.updateComplete;
+                }
+
+                this.$(".wrapper").classList.add("active");
+                if (typeof router.params.next !== "undefined") {
+                    router.go(router.params.next, {}, true);
+                } else {
+                    this._routeChanged();
+                }
+            },
+            instant ? 0 : 600
+        );
+    }
+
+    protected _loggedIn() {}
+    protected _loggedOut() {}
 
     @listen("toggle-menu")
     _toggleMenu() {
@@ -358,6 +393,10 @@ class App extends ServiceWorker(StateMixin(AutoSync(ErrorHandling(AutoLock(BaseE
 
     @listen("route-changed", router)
     async _routeChanged() {
+        if (!this._ready) {
+            return;
+        }
+
         Dialog.closeAll();
 
         await app.loaded;
@@ -398,7 +437,7 @@ class App extends ServiceWorker(StateMixin(AutoSync(ErrorHandling(AutoLock(BaseE
             if (path === "unlock") {
                 this._startView.unlock();
             } else {
-                router.go("unlock", path ? { next: path, nobio: "1" } : undefined, true);
+                router.go("unlock", path ? { next: path, nobio: "1", ...router.params } : undefined, true);
             }
             return;
         }
@@ -425,13 +464,14 @@ class App extends ServiceWorker(StateMixin(AutoSync(ErrorHandling(AutoLock(BaseE
         } else if ((match = path.match(/^items(?:\/([^\/]+))?$/))) {
             const [, id] = match;
 
-            const { vault, tag, favorites, attachments, recent } = router.params;
+            const { vault, tag, favorites, attachments, recent, host } = router.params;
             this._items.selected = id || "";
             this._items.vault = vault || "";
             this._items.tag = tag || "";
             this._items.favorites = favorites === "true";
             this._items.attachments = attachments === "true";
             this._items.recent = recent === "true";
+            this._items.host = host === "true";
             this._openView(this._items);
 
             this._menu.selected = vault
@@ -444,20 +484,23 @@ class App extends ServiceWorker(StateMixin(AutoSync(ErrorHandling(AutoLock(BaseE
                 ? "recent"
                 : attachments
                 ? "attachments"
+                : host
+                ? "host"
                 : "items";
 
             const item = id && app.getItem(id);
             if (item) {
+                const { newitem, edit, addattachment, ...rest } = router.params;
+                router.params = rest;
+                this._itemDialog.isNew = typeof newitem !== "undefined";
                 this._itemDialog.show(item.item.id);
-                const { edit, addattachment, ...rest } = router.params;
                 if (typeof edit !== "undefined") {
                     this._itemDialog.edit();
-                    if (typeof addattachment !== "undefined") {
+                    if (this._itemDialog.isNew && typeof addattachment !== "undefined") {
                         this._itemDialog.addAttachment();
                     }
-                    router.params = rest;
                 }
-                app.updateItem(item.vault, item.item, { lastUsed: new Date() });
+                app.updateLastUsed(item.item);
             }
         } else if ((match = path.match(/^invite\/([^\/]+)\/([^\/]+)$/))) {
             const [, orgId, id] = match;
@@ -508,28 +551,11 @@ class App extends ServiceWorker(StateMixin(AutoSync(ErrorHandling(AutoLock(BaseE
         }
 
         if (view) {
-            // const backward = direction === "backward" && this._view;
-            // animateElement(view, {
-            //     animation: backward ? "viewOut" : "viewIn",
-            //     duration: 400,
-            //     easing: "cubic-bezier(0.6, 0, 0.2, 1)",
-            //     fill: "backwards",
-            //     direction: backward ? "reverse" : "normal"
-            // });
             view.classList.add("showing");
             view.active = true;
         }
 
         if (this._view) {
-            // const backward = direction === "backward" || !view;
-            // animateElement(this._view, {
-            //     animation: backward ? "viewIn" : "viewOut",
-            //     duration: 400,
-            //     easing: "cubic-bezier(0.6, 0, 0.2, 1)",
-            //     fill: "forwards",
-            //     direction: backward ? "reverse" : "normal"
-            // });
-            // await wait(350);
             this._view.classList.remove("showing");
             this._view.active = false;
         }
@@ -543,7 +569,6 @@ class App extends ServiceWorker(StateMixin(AutoSync(ErrorHandling(AutoLock(BaseE
             return;
         }
 
-        let shortcut;
         const control = event.ctrlKey || event.metaKey;
 
         // ESCAPE -> Back
@@ -552,16 +577,12 @@ class App extends ServiceWorker(StateMixin(AutoSync(ErrorHandling(AutoLock(BaseE
                 Dialog.closeAll();
             }
         }
-        // CTRL/CMD + F -> Filter
+        // CTRL/CMD (+ Shift) + F -> Search (All)
         else if (control && event.key === "f") {
-            router.go("items");
-            shortcut = () => this._items.search();
-        }
-
-        // If one of the shortcuts matches, execute it and prevent the default behaviour
-        if (shortcut) {
-            shortcut();
             event.preventDefault();
+            const { vault, tags, recent, favorites, attachments, ...rest } = router.params;
+            router.go("items", event.shiftKey ? rest : { vault, tags, recent, favorites, attachments, ...rest });
+            this._items.search();
         }
     }
 
@@ -576,17 +597,8 @@ class App extends ServiceWorker(StateMixin(AutoSync(ErrorHandling(AutoLock(BaseE
 
     @listen("create-item")
     async _newItem() {
-        const template = await this._templateDialog.show();
-        if (template) {
-            const item = await this._createItemDialog.show(template);
-            if (item) {
-                const params = { ...router.params, edit: "true" } as any;
-                if (template.attachment) {
-                    params.addattachment = "true";
-                }
-                router.go(`items/${item.id}`, params);
-            }
-        }
+        const vault = (router.params.vault && app.getVault(router.params.vault)) || undefined;
+        await this._createItemDialog.show(vault);
     }
 
     @listen("create-org")
@@ -698,6 +710,19 @@ class App extends ServiceWorker(StateMixin(AutoSync(ErrorHandling(AutoLock(BaseE
             type: "success",
             preventAutoClose: true
         });
+    }
+
+    @listen("field-dragged")
+    protected async _fieldDragged({
+        detail: { event, item, index }
+    }: CustomEvent<{ item: VaultItem; index: number; event: DragEvent }>) {
+        const field = item.fields[index];
+        const target = event.target as HTMLElement;
+        target.classList.add("dragging");
+        target.addEventListener("dragend", () => target.classList.remove("dragging"), { once: true });
+        const totp: TOTPElement | null =
+            target.querySelector("pl-totp") || (target.shadowRoot && target.shadowRoot.querySelector("pl-totp"));
+        event.dataTransfer!.setData("text/plain", field.type === "totp" && totp ? totp.token : field.value);
     }
 }
 

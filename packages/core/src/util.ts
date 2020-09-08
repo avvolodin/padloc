@@ -106,7 +106,39 @@ export function debounce(fn: (...args: any[]) => any, delay: number) {
 
     return function(...args: any[]) {
         clearTimeout(timeout);
-        timeout = window.setTimeout(() => fn(args), delay);
+        timeout = window.setTimeout(() => fn(...args), delay);
+    };
+}
+
+// export function throttle(fn: (...args: any[]) => any, delay: number) {
+//     let throttling = false;
+//     let lastCall = args: any[];
+//
+//     return function(...args: any[]) {
+//         if (!throttling) {
+//             fn(...args);
+//             throttling = true;
+//             setTimeout(() => (throttling = false), delay);
+//         }
+//     };
+// }
+
+export function throttle(fn: (...args: any[]) => any, delay: number) {
+    let lastCall: any;
+    let lastRan: number;
+    return (...args: any[]) => {
+        if (!lastRan) {
+            fn(...args);
+            lastRan = Date.now();
+        } else {
+            clearTimeout(lastCall);
+            lastCall = setTimeout(() => {
+                if (Date.now() - lastRan >= delay) {
+                    fn(...args);
+                    lastRan = Date.now();
+                }
+            }, delay - (Date.now() - lastRan));
+        }
     };
 }
 

@@ -24,3 +24,5 @@ packages/server/attachments
 /logs
 /pwa
 /data
+packages/extension/dist
+packages/tauri/dist

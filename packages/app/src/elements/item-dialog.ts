@@ -9,7 +9,7 @@ import { alert, confirm, dialog } from "../lib/dialog";
 import { app, router } from "../globals";
 import { setClipboard } from "../lib/clipboard";
 import { animateCascade } from "../lib/animation";
-import { element, html, css, property, query, queryAll } from "./base";
+import { element, html, css, property, query, queryAll, observe } from "./base";
 import { Dialog } from "./dialog";
 import "./icon";
 import { Input } from "./input";
@@ -29,6 +29,9 @@ export class ItemDialog extends Dialog<string, void> {
     @property()
     itemId: VaultItemID = "";
 
+    @property()
+    isNew: boolean = false;
+
     get _item() {
         const found = (this.itemId && app.getItem(this.itemId)) || null;
         return found && found.item;
@@ -40,7 +43,7 @@ export class ItemDialog extends Dialog<string, void> {
     }
 
     @property({ reflect: true, attribute: "editing" })
-    private _editing: Boolean = false;
+    private _editing: boolean = false;
 
     @property()
     private _fields: Field[] = [];
@@ -110,6 +113,12 @@ export class ItemDialog extends Dialog<string, void> {
     dismiss() {
         super.dismiss();
         router.go("items");
+    }
+
+    done() {
+        super.done();
+        this.itemId = "";
+        this._itemChanged();
     }
 
     static styles = [
@@ -231,6 +240,10 @@ export class ItemDialog extends Dialog<string, void> {
                 background: rgba(255, 255, 255, 0.9);
             }
 
+            .actions {
+                grid-template-columns: 1fr 1fr;
+            }
+
             .actions > button {
                 font-size: var(--font-size-small);
                 background: none;
@@ -249,10 +262,6 @@ export class ItemDialog extends Dialog<string, void> {
                 flex: 1;
                 max-width: 200px;
                 min-width: 120px;
-            }
-
-            pl-field.dragging {
-                opacity: 0.2;
             }
 
             :host(.dragging) .content > * {
@@ -300,17 +309,17 @@ export class ItemDialog extends Dialog<string, void> {
             return html``;
         }
 
-        const { updated, updatedBy, favorited } = this._item!;
+        const { updated, updatedBy } = this._item!;
         const vault = this._vault!;
         const org = vault.org && app.getOrg(vault.org.id);
         const readonly = !app.hasWritePermissions(vault);
         const updatedByMember = org && org.getMember({ id: updatedBy });
         const attachments = this._item!.attachments || [];
-        const isFavorite = favorited && favorited.includes(app.account!.id);
+        const isFavorite = app.account!.favorites.has(this.itemId);
 
         return html`
             <header>
-                <pl-icon icon="backward" class="tap close-icon" @click=${this.dismiss}></pl-icon>
+                <pl-icon icon="close" class="tap close-icon" @click=${this.dismiss} ?hidden=${this._editing}></pl-icon>
                 <pl-input
                     id="nameInput"
                     class="name flex"
@@ -340,7 +349,7 @@ export class ItemDialog extends Dialog<string, void> {
                             .type=${field.type}
                             .editing=${this._editing}
                             @edit=${() => this._editField(index)}
-                            @copy=${() => setClipboard(this._item!, field)}
+                            @copy-clipboard=${() => setClipboard(this._item!, field)}
                             @remove=${() => this._removeField(index)}
                             @generate=${() => this._generateValue(index)}
                             @get-totp-qr=${() => this._getTotpQR(index)}
@@ -390,7 +399,7 @@ export class ItemDialog extends Dialog<string, void> {
                         <div>${$l("Move")}</div>
                     </button>
 
-                    <button class="icon tap negative" @click=${this._deleteItem}>
+                    <button class="icon tap negative" @click=${this._deleteItem} ?hidden=${this.isNew}>
                         <pl-icon icon="delete"></pl-icon>
                         <div>${$l("Delete")}</div>
                     </button>
@@ -432,41 +441,58 @@ export class ItemDialog extends Dialog<string, void> {
         }
         this._editing = true;
         await this.updateComplete;
-        this._nameInput.focus();
+        setTimeout(() => this._nameInput.focus(), 100);
     }
 
     async cancelEdit() {
-        this._fields = this._getFields();
-        await this.updateComplete;
-        this._editing = false;
-        this._itemChanged();
+        if (this.isNew) {
+            app.deleteItems([this._item!]);
+            this.dismiss();
+        } else {
+            this._fields = this._getFields();
+            await this.updateComplete;
+            this._editing = false;
+            this._itemChanged();
+        }
+        this.isNew = false;
     }
 
     save() {
-        app.updateItem(this._vault!, this._item!, {
+        app.updateItem(this._item!, {
             name: this._nameInput.value,
             fields: this._getFields(),
             tags: this._tagsInput.tags
         });
         this._editing = false;
         this._itemChanged();
+        this.isNew = false;
+    }
+
+    @observe("_editing")
+    _editingChanged() {
+        this.dismissOnTapOutside = !this._editing;
     }
 
     private _getFields() {
         return [...this._fieldInputs].map((fieldEl: FieldElement) => {
-            return {
+            return new Field({
                 name: fieldEl.name,
                 value: fieldEl.value,
                 type: fieldEl.type
-            };
+            });
         });
     }
 
     private _itemChanged() {
-        const item = this._item!;
-        this._nameInput.value = item.name;
-        this._fields = item.fields.map(f => ({ ...f }));
-        this._tagsInput.tags = [...item.tags];
+        if (this._item) {
+            this._nameInput.value = this._item.name;
+            this._fields = this._item.fields.map(f => new Field({ ...f }));
+            this._tagsInput.tags = [...this._item.tags];
+        } else {
+            this._nameInput.value = "";
+            this._fields = [];
+            this._tagsInput.tags = [];
+        }
     }
 
     private _removeField(index: number) {
@@ -479,7 +505,7 @@ export class ItemDialog extends Dialog<string, void> {
             type: "destructive"
         });
         if (confirmed) {
-            app.deleteItems([{ vault: this._vault!, item: this._item! }]);
+            app.deleteItems([this._item!]);
             router.go("items");
         } else {
             this.open = true;
@@ -488,14 +514,14 @@ export class ItemDialog extends Dialog<string, void> {
 
     private async _addField() {
         this.open = false;
-        const fieldType = await this._fieldTypeDialog.show();
+        const fieldDef = await this._fieldTypeDialog.show();
         this.open = true;
 
-        if (!fieldType) {
+        if (!fieldDef) {
             return;
         }
 
-        this._fields.push({ name: "", value: "", type: fieldType });
+        this._fields.push(new Field({ name: fieldDef.name, value: "", type: fieldDef.type }));
         this.requestUpdate();
         await this.updateComplete;
         setTimeout(() => this._fieldInputs[this._fields.length - 1].focus(), 100);
@@ -582,7 +608,7 @@ export class ItemDialog extends Dialog<string, void> {
     }
 
     private _setFavorite(favorite: boolean) {
-        app.updateItem(this._vault!, this._item!, { favorite });
+        app.toggleFavorite(this.itemId, favorite);
         this.requestUpdate();
     }
 
@@ -611,12 +637,11 @@ export class ItemDialog extends Dialog<string, void> {
         return false;
     }
 
-    private _dragstart(e: DragEvent, index: number) {
-        // console.log("dragstart", e);
+    private async _dragstart(event: DragEvent, index: number) {
+        // console.log("dragstart", event);
         this._draggingIndex = index;
-        e.dataTransfer!.effectAllowed = "move";
-        e.dataTransfer!.setData("text/plain", "foo");
-        (e.target as HTMLElement).classList.add("dragging");
+        this.dispatch("field-dragged", { item: this._item, index, event });
+        (event.target as HTMLElement).classList.add("dragging");
         this.classList.add("dragging");
     }
 

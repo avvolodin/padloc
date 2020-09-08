@@ -21,6 +21,8 @@ export class Dialog<I, R> extends BaseElement {
     preventDismiss: boolean = false;
     @property()
     preventAutoClose: boolean = false;
+    @property()
+    dismissOnTapOutside: boolean = true;
 
     readonly hideApp: boolean = false;
 
@@ -66,7 +68,6 @@ export class Dialog<I, R> extends BaseElement {
                 justify-content: center;
                 padding: 12px;
                 box-sizing: border-box;
-                perspective: 1000px;
                 transition: transform 400ms cubic-bezier(0.08, 0.85, 0.3, 1.15) 0s,
                     opacity 200ms cubic-bezier(0.6, 0, 0.2, 1) 0s;
             }
@@ -104,6 +105,12 @@ export class Dialog<I, R> extends BaseElement {
                 ${mixins.scroll()}
             }
 
+            .footer {
+                background: var(--color-tertiary);
+                margin: 0;
+                border-top: solid 1px var(--color-shade-1);
+            }
+
             .actions {
                 display: grid;
                 grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
@@ -134,7 +141,7 @@ export class Dialog<I, R> extends BaseElement {
         return html`
             <div class="scrim"></div>
 
-            <div class="outer" @click=${() => this.dismiss()}>
+            <div class="outer" @click=${this._tappedOutside}>
                 ${this.renderBefore()}
                 <div id="inner" class="inner" @click=${(e: Event) => e.stopPropagation()}>
                     ${this.renderContent()}
@@ -199,6 +206,12 @@ export class Dialog<I, R> extends BaseElement {
         }
 
         this.dispatch(this.open ? "dialog-open" : "dialog-close", { dialog: this }, true, true);
+    }
+
+    private _tappedOutside() {
+        if (this.dismissOnTapOutside) {
+            this.dismiss();
+        }
     }
 
     dismiss() {

@@ -5,37 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic Versioning](http://semver.org/spec/v2.0.0.html).
 
-## 2.7.2
+## 3.1.2
 
-## Fixed
+-   Fixes bug that caused values from previously created vault item to be
+    pre-filled when creating the next item.
+-   Fixes attachment previews on Android
 
-- Fixed bug that caused app to error out during saving/synchronization after adding a field to a record
+## 3.1.1
 
-## 2.7.1
+-   Fixes various bugs related to shared vault syncing and billing.
 
-### Fixed
+## 3.1.0
 
-- Fixed bug that caused app to require subscription when using custom server
-- Fixed bug that prevented ctrl+f / type-to-search after window regained focus
+### New Stuff & Improvements
 
-## 2.7.0
+-   Improved flow for creating a vault item
+-   If a vault filter is active, preselect that vault during vault item creation
+-   Prefill field names with sensible default when adding new field
+-   Automated account migration if legacy account is detected during login/signup
+-   "Login" vault item template is now called "Website / App"
+-   Added new vault item template "Computer"
+-   [DESKTOP] Ctrl/cmd + Shift + F to search all items (resetting any active filters)
+-   [ANDROID] Allow reordering fields via drag and drop on Android
+-   [SERVER] Option to enable secure connection when sending emails, enabled via `PL_EMAIL_SECURE` environment variable
 
-### Added
+### Bug Fixes
 
-- Started a changelog!
-- New "tags" section in menu that allows filter by a given tag
+-   Sometimes the app would show a blank screen directly after unlocking.
+-   Changes made to a vault item directly after creating it would sometimes be discarded.
 
-### Changed
+## 3.0.0
 
-- Fields in list view are now displayed horizontally in a scrollable container
-- Displayed fields in list view are no longer limited to 4
-- Editing fields now happens in a dialog instead of inline. This improves the experience
-  on mobile and prevents accidental edits.
-- Field values are now truncated in the record view. To view the full value, select the
-  field by clicking on it.
-- Categories have been replaced with 'tags'. Records can have multiple tags.
-
-### Removed
-
-- The hover-to-show feature has been removed from the list view as it didn't provide
-  enough value to justify possible security risks.
+Initial release of Padloc 3 (changes before 3.0.0 are not included in this change log).

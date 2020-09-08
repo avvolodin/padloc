@@ -38,9 +38,10 @@ export class PremiumDialog extends Dialog<void, void> {
         const params =
             this._updateBillingParams ||
             new UpdateBillingParams({
-                plan: this.plan!.id,
                 account: app.account!.id
             });
+
+        params.plan = this.plan!.id;
 
         try {
             await app.updateBilling(params);
@@ -219,13 +220,17 @@ export class PremiumDialog extends Dialog<void, void> {
     ];
 
     renderContent() {
-        if (!this.plan) {
+        if (!this.plan || !app.account) {
             return html``;
         }
 
         const plan = this.plan;
         const monthlyPrice = Math.round(plan.cost / 12);
-        const paymentMethod = this._updateBillingParams && this._updateBillingParams.paymentMethod;
+        const paymentMethod =
+            (this._updateBillingParams && this._updateBillingParams.paymentMethod) ||
+            (app.account.billing && app.account.billing.paymentMethod);
+
+        const trialDaysLeft = app.account.billing ? app.account.billing.trialDaysLeft : 30;
 
         return html`
             <div
@@ -243,11 +248,11 @@ export class PremiumDialog extends Dialog<void, void> {
 
                     <div class="flex"></div>
 
-                    <div class="plan-trial">
-                        ${$l("Free For {0} Days", (30).toString())}
+                    <div class="plan-trial" ?hidden=${!trialDaysLeft}>
+                        ${$l("Free For {0} Days", trialDaysLeft.toString())}
                     </div>
 
-                    <div class="plan-then">
+                    <div class="plan-then" ?hidden=${!trialDaysLeft}>
                         ${$l("then")}
                     </div>
 
@@ -302,7 +307,7 @@ export class PremiumDialog extends Dialog<void, void> {
                 </div>
 
                 <pl-loading-button id="submitButton" class="tap primary" @click=${this._submit}>
-                    ${$l("Start Trial")}
+                    ${trialDaysLeft ? $l("Start Trial") : $l("Buy Now")}
                 </pl-loading-button>
             </div>
         `;

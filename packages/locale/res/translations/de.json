@@ -917,7 +917,7 @@
   ],
   [
     "This organization currently does not have an active subscription and has been put in \"frozen\" state as a result. While in this state, you won't be able to make any changes to members, groups or vaults of this organization.",
-    "Diese Organisation hat momentan kein aktives Abonnement und wurde deshalb eingefroren. Du kannst also momentan keine Änderungen an Mitglieschaften, Gruppen oder Tresoren dieser Organisation machen."
+    "Diese Organisation hat momentan kein aktives Abonnement und wurde deshalb eingefroren. Du kannst also momentan keine Änderungen an Mitgliedschaften, Gruppen oder Tresoren dieser Organisation machen."
   ],
   [
     "Update Subscription",
@@ -1153,7 +1153,7 @@
   ],
   [
     "Please enter your master password to proceed.",
-    "Bitte gib dein neues Masterpasswort ein um fortzufahreen."
+    "Bitte gib dein Masterpasswort ein um fortzufahren."
   ],
   [
     "Are you sure you want to delete this account? All associated vaults and the data within them will be lost and any active subscriptions will be canceled immediately. This action can not be undone!",
@@ -1468,8 +1468,8 @@
     "PIN"
   ],
   [
-    "Two-Factor Token",
-    "Zweifaktor-Code"
+    "2FA Token",
+    "2FA-Code"
   ],
   [
     "Note",

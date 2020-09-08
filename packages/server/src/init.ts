@@ -1,6 +1,5 @@
 import { Server, ServerConfig } from "@padloc/core/src/server";
 import { setPlatform } from "@padloc/core/src/platform";
-import { BillingProvider } from "@padloc/core/src/billing";
 import { Logger } from "@padloc/core/src/log";
 import { NodePlatform } from "./platform";
 import { HTTPReceiver } from "./http";
@@ -9,6 +8,7 @@ import { EmailMessenger } from "./messenger";
 import { FileSystemStorage } from "./attachment";
 import { StripeBillingProvider } from "./billing";
 import { ReplServer } from "./repl";
+import { NodeLegacyServer } from "./legacy";
 
 async function init() {
     setPlatform(new NodePlatform());
@@ -32,6 +32,7 @@ async function init() {
     const messenger = new EmailMessenger({
         host: process.env.PL_EMAIL_SERVER || "",
         port: process.env.PL_EMAIL_PORT || "",
+        secure: process.env.PL_EMAIL_SECURE === "true",
         user: process.env.PL_EMAIL_USER || "",
         password: process.env.PL_EMAIL_PASSWORD || "",
         from: process.env.PL_EMAIL_FROM || ""
@@ -45,7 +46,21 @@ async function init() {
     });
     // const billingProvider = new StubBillingProvider();
 
-    let billingProvider: BillingProvider | undefined = undefined;
+    let port = parseInt(process.env.PL_SERVER_PORT!);
+    if (isNaN(port)) {
+        port = 3000;
+    }
+
+    let legacyServer: NodeLegacyServer | undefined = undefined;
+
+    if (process.env.PL_LEGACY_URL && process.env.PL_LEGACY_KEY) {
+        legacyServer = new NodeLegacyServer({
+            url: process.env.PL_LEGACY_URL,
+            key: process.env.PL_LEGACY_KEY
+        });
+    }
+
+    const server = new Server(config, storage, messenger, logger, attachmentStorage, legacyServer);
 
     if (process.env.PL_BILLING_ENABLED === "true") {
         let billingPort = parseInt(process.env.PL_BILLING_PORT!);
@@ -59,20 +74,13 @@ async function init() {
                 publicKey: process.env.PL_BILLING_STRIPE_PUBLIC_KEY || "",
                 webhookPort: billingPort
             },
-            storage
+            server
         );
 
         await stripeProvider.init();
 
-        billingProvider = stripeProvider;
+        server.billingProvider = stripeProvider;
     }
-
-    let port = parseInt(process.env.PL_SERVER_PORT!);
-    if (isNaN(port)) {
-        port = 3000;
-    }
-
-    const server = new Server(config, storage, messenger, logger, attachmentStorage, billingProvider);
 
     console.log(`Starting server on port ${port}`);
     new HTTPReceiver(port).listen(req => server.handle(req));

@@ -21,7 +21,7 @@ export class FieldElement extends BaseElement {
     value: string = "";
 
     @property()
-    type: FieldType = "note";
+    type: FieldType = FieldType.Note;
 
     @property()
     private _masked: boolean = false;
@@ -37,10 +37,10 @@ export class FieldElement extends BaseElement {
     }
 
     private get _fieldActions() {
-        const actions = [{ icon: "copy", action: () => this.dispatch("copy") }];
+        const actions = [{ icon: "copy", action: () => this.dispatch("copy-clipboard") }];
 
         if (this._fieldDef.mask) {
-            actions.push({ icon: this._masked ? "show" : "hide", action: () => this._masked = !this._masked });
+            actions.push({ icon: this._masked ? "show" : "hide", action: () => (this._masked = !this._masked) });
         }
 
         return actions;
@@ -56,6 +56,15 @@ export class FieldElement extends BaseElement {
         this._masked = this._fieldDef.mask;
     }
 
+    @observe("editing")
+    _editingChanged() {
+        if (!this.editing) {
+            this.setAttribute("draggable", "true");
+        } else {
+            this.removeAttribute("draggable");
+        }
+    }
+
     static styles = [
         shared,
         css`
@@ -63,6 +72,7 @@ export class FieldElement extends BaseElement {
                 display: flex;
                 border-radius: 8px;
                 min-height: 80px;
+                opacity: 0.999;
             }
 
             .field-buttons {
@@ -111,7 +121,8 @@ export class FieldElement extends BaseElement {
                 margin-left: 4px;
             }
 
-            .value-input, .value-display {
+            .value-input,
+            .value-display {
                 font-family: var(--font-family-mono);
                 font-size: 110%;
                 padding: 4px 8px;
@@ -121,8 +132,10 @@ export class FieldElement extends BaseElement {
             }
 
             .value-display {
-                white-space: normal;
+                white-space: pre-wrap;
                 overflow-wrap: break-word;
+                user-select: text;
+                cursor: text;
             }
 
             .fields-container {
@@ -137,7 +150,8 @@ export class FieldElement extends BaseElement {
                 line-height: 30px;
             }
 
-            .name-input, .value-input {
+            .name-input,
+            .value-input {
                 height: auto;
                 box-sizing: border-box;
                 background: none;
@@ -151,23 +165,22 @@ export class FieldElement extends BaseElement {
                 border: none;
             }
 
-            .drag-handle {
+            :host([draggable]),
+            :host([draggable]) .name-input {
                 cursor: grab;
             }
 
-            .drag-handle:active {
+            :host([draggable]):active {
                 cursor: grabbing;
-            }
-
-            @media (hover: none) {
-                .drag-handle {
-                    display: none;
-                }
             }
 
             @supports (-webkit-overflow-scrolling: touch) {
                 .field-header pl-icon {
                     top: 11px;
+                }
+
+                .drag-handle {
+                    display: none;
                 }
             }
         `
@@ -212,7 +225,7 @@ export class FieldElement extends BaseElement {
                     >
                     </pl-input>
                     <pl-icon icon="qrcode" class="tap" @click=${() => this.dispatch("get-totp-qr")}></pl-icon>
-                `
+                `;
             case "password":
                 return html`
                     <pl-input
@@ -224,7 +237,7 @@ export class FieldElement extends BaseElement {
                     >
                     </pl-input>
                     <pl-icon icon="generate" class="tap" @click=${() => this.dispatch("generate")}></pl-icon>
-                `
+                `;
 
             default:
                 let inputType: string;
@@ -288,18 +301,16 @@ export class FieldElement extends BaseElement {
                 </div>
 
                 <div class="field-value">
-                    ${ this.editing ? this._renderEditValue() : this._renderDisplayValue() }
+                    ${this.editing ? this._renderEditValue() : this._renderDisplayValue()}
                 </div>
             </div>
 
             <div class="field-buttons right" ?hidden=${this.editing}>
-
                 ${this._fieldActions.map(
                     ({ icon, action }) => html`
                         <pl-icon icon=${icon} class="tap" @click=${action}></pl-icon>
                     `
                 )}
-
             </div>
         `;
     }

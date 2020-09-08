@@ -37,7 +37,7 @@ export class UpdateSubscriptionDialog extends Dialog<Org, void> {
         const promise = super.show();
         this._error = "";
         this.org = org;
-        const sub = org.billing!.subscription;
+        const sub = org.billing && org.billing.subscription;
         if (sub) {
             this.plan = sub.plan;
             this.quantity = sub.members;
@@ -80,7 +80,7 @@ export class UpdateSubscriptionDialog extends Dialog<Org, void> {
 
     private async _changePlan() {
         this.open = false;
-        const plan = await this._choosePlanDialog.show();
+        const plan = await this._choosePlanDialog.show(this.org || undefined);
         if (plan) {
             this.plan = plan;
             this.quantity = plan.min;

@@ -1,18 +1,26 @@
-import { loadLanguage } from "@padloc/locale/src/translate";
+import { loadLanguage, translate as $l } from "@padloc/locale/src/translate";
 import { Storage, Storable } from "./storage";
-import { Serializable, bytesToBase64, base64ToBytes } from "./encoding";
+import {
+    Serializable,
+    Serialize,
+    AsDate,
+    AsSerializable,
+    bytesToBase64,
+    base64ToBytes,
+    stringToBytes
+} from "./encoding";
 import { Invite, InvitePurpose } from "./invite";
 import { Vault, VaultID } from "./vault";
 import { Org, OrgID, OrgType, OrgMember, OrgRole, Group } from "./org";
 import { VaultItem, VaultItemID, Field, Tag, createVaultItem } from "./item";
 import { Account, AccountID } from "./account";
 import { Auth } from "./auth";
-import { EmailVerificationPurpose } from "./email-verification";
+import { MFAPurpose } from "./mfa";
 import { Session, SessionID } from "./session";
 import {
     API,
-    RequestEmailVerificationParams,
-    CompleteEmailVerificationParams,
+    RequestMFACodeParams,
+    RetrieveMFATokenParams,
     CreateAccountParams,
     InitAuthParams,
     InitAuthResponse,
@@ -24,7 +32,6 @@ import {
 } from "./api";
 import { Client } from "./client";
 import { Sender } from "./transport";
-import { translate as $l } from "@padloc/locale/src/translate";
 import {
     DeviceInfo,
     getDeviceInfo,
@@ -32,27 +39,22 @@ import {
     keyStoreSet,
     keyStoreGet,
     keyStoreDelete,
-    getCryptoProvider
+    getCryptoProvider,
+    getStorage
 } from "./platform";
-import { uuid } from "./util";
+import { uuid, throttle } from "./util";
 import { Client as SRPClient } from "./srp";
 import { Err, ErrorCode } from "./error";
 import { Attachment, AttachmentInfo } from "./attachment";
 import { BillingProviderInfo, UpdateBillingParams } from "./billing";
 import { SimpleContainer } from "./container";
-import { AESKeyParams } from "./crypto";
+import { AESKeyParams, PBKDF2Params } from "./crypto";
 
 /** Various usage stats */
 export class Stats extends Serializable {
     /** Time of last sync */
+    @AsDate()
     lastSync?: Date;
-
-    fromRaw({ lastSync }: any) {
-        Object.assign(this, {
-            lastSync: new Date(lastSync)
-        });
-        return this;
-    }
 }
 
 /** Various application settings */
@@ -67,29 +69,115 @@ export class Settings extends Serializable {
     recentLimit: number = 7;
 }
 
+export interface HashedItem {
+    hosts: string[];
+}
+
+export class Index extends Serializable {
+    @AsSerializable(PBKDF2Params)
+    hashParams = new PBKDF2Params({ iterations: 1 });
+
+    items: HashedItem[] = [];
+
+    async fromItems(items: VaultItem[]) {
+        const crypto = getCryptoProvider();
+
+        if (!this.hashParams.salt.length) {
+            this.hashParams.salt = await crypto.randomBytes(16);
+        }
+
+        this.items = (
+            await Promise.all(
+                items.map(async item => ({
+                    hosts: (
+                        await Promise.all(
+                            item.fields
+                                .filter(f => f.type === "url")
+                                .map(async f => {
+                                    // try to parse host from url. if url is not valid,
+                                    // assume the url field contains just the domain.
+                                    let host = f.value;
+                                    try {
+                                        host = new URL(f.value).host;
+                                    } catch (e) {}
+
+                                    if (!host) {
+                                        return null;
+                                    }
+
+                                    const hashedHost = await crypto.deriveKey(stringToBytes(host), this.hashParams);
+
+                                    console.log(
+                                        "setting index for host",
+                                        host,
+                                        stringToBytes(host),
+                                        this.hashParams.salt,
+                                        bytesToBase64(hashedHost)
+                                    );
+
+                                    return bytesToBase64(hashedHost);
+                                })
+                        )
+                    ).filter(h => h !== null) as string[]
+                }))
+            )
+        ).filter(item => item.hosts.length);
+    }
+
+    async matchHost(host: string) {
+        const hashedHost = bytesToBase64(await getCryptoProvider().deriveKey(stringToBytes(host), this.hashParams));
+        console.log("matching host", host, stringToBytes(host), this.hashParams.salt, hashedHost);
+        return this.items.filter(item => item.hosts.some(h => h === hashedHost)).length;
+    }
+
+    async fuzzyMatchHost(host: string) {
+        // Try exact match first, then try to add/remove "www."
+        return (
+            (await this.matchHost(host)) ||
+            (host.startsWith("www.") ? this.matchHost(host.slice(4)) : this.matchHost("www." + host))
+        );
+    }
+
+    async matchUrl(url: string) {
+        try {
+            const { host } = new URL(url);
+            return this.fuzzyMatchHost(host);
+        } catch (e) {
+            return 0;
+        }
+    }
+}
+
 /** Application state */
 export class AppState extends Storable {
     id = "app-state";
 
     /** Application Settings */
+    @AsSerializable(Settings)
     settings = new Settings();
 
-    /** Usage datra */
+    /** Usage data */
+    @AsSerializable(Stats)
     stats = new Stats();
 
     /** Info about current device */
+    @AsSerializable(DeviceInfo)
     device = new DeviceInfo();
 
     /** Current [[Session]] */
+    @AsSerializable(Session)
     session: Session | null = null;
 
     /** Currently logged in [[Account]] */
+    @AsSerializable(Account)
     account: Account | null = null;
 
     /** All organizations the current [[account]] is a member of. */
+    @AsSerializable(Org)
     orgs: Org[] = [];
 
     /** All vaults the current [[account]] has access to. */
+    @AsSerializable(Vault)
     vaults: Vault[] = [];
 
     /** Whether a sync is currently in process. */
@@ -98,9 +186,24 @@ export class AppState extends Storable {
     /** Whether the app has an internet connection at the moment */
     online = true;
 
+    @AsSerializable(SimpleContainer)
     rememberedMasterKey: SimpleContainer | null = null;
 
+    @AsSerializable(BillingProviderInfo)
     billingProvider: BillingProviderInfo | null = null;
+
+    currentHost: string = "";
+
+    @AsSerializable(Index)
+    index: Index = new Index();
+
+    /** IDs of most recently used items. The most recently used item is last */
+    @Serialize({
+        arrayDeserializeIndividually: false,
+        fromRaw: (raw: [string, string][]) => new Map<string, Date>(raw.map(([id, date]) => [id, new Date(date)])),
+        toRaw: (val: any) => [...val]
+    })
+    lastUsed = new Map<string, Date>();
 
     _errors: Err[] = [];
 
@@ -131,19 +234,6 @@ export class AppState extends Storable {
     /** Whether a user is logged in */
     get loggedIn() {
         return !!this.session;
-    }
-
-    fromRaw({ settings, stats, device, session, account, orgs, vaults, rememberedMasterKey, billingProvider }: any) {
-        this.settings.fromRaw(settings);
-        this.stats.fromRaw(stats);
-        this.device.fromRaw(device);
-        this.session = (session && new Session().fromRaw(session)) || null;
-        this.account = (account && new Account().fromRaw(account)) || null;
-        this.orgs = orgs.map((org: any) => new Org().fromRaw(org));
-        this.vaults = vaults.map((vault: any) => new Vault().fromRaw(vault));
-        this.rememberedMasterKey = rememberedMasterKey && new SimpleContainer().fromRaw(rememberedMasterKey);
-        this.billingProvider = billingProvider && new BillingProviderInfo().fromRaw(billingProvider);
-        return this;
     }
 }
 
@@ -214,20 +304,23 @@ export class App {
     state = new AppState();
 
     /** Promise that is resolved when the app has been fully loaded */
-    loaded = this.load();
+    loaded: Promise<void>;
+
+    storage: Storage;
 
     constructor(
-        /** Persistent storage provider */
-        public storage: Storage,
         /** Data transport provider */
-        sender: Sender
+        sender: Sender,
+        storage = getStorage()
     ) {
+        this.storage = storage;
         this.api = new Client(this.state, sender, (_req, _res, err) => {
             const online = !err || err.code !== ErrorCode.FAILED_CONNECTION;
             if (online !== this.state.online) {
                 this.setState({ online });
             }
         });
+        this.loaded = this.load();
     }
 
     /** Promise that resolves once all current synchronization processes are complete */
@@ -262,7 +355,7 @@ export class App {
 
     /** The current users main, or "private" [[Vault]] */
     get mainVault(): Vault | null {
-        return (this.account && this.getVault(this.account.mainVault)) || null;
+        return (this.account && this.getVault(this.account.mainVault.id)) || null;
     }
 
     get online() {
@@ -281,6 +374,34 @@ export class App {
         return !!this.state.billingProvider && !(this.state.account && this.state.account.billingDisabled);
     }
 
+    get count() {
+        const count = {
+            favorites: 0,
+            attachments: 0,
+            recent: 0,
+            total: 0,
+            currentHost: this.state.currentHost ? this.getItemsForHost(this.state.currentHost).length : 0
+        };
+
+        const recentThreshold = new Date(Date.now() - this.settings.recentLimit * 24 * 60 * 60 * 1000);
+        for (const vault of this.vaults) {
+            for (const item of vault.items) {
+                count.total++;
+                if (this.account && this.account.favorites.has(item.id)) {
+                    count.favorites++;
+                }
+                if (item.attachments.length) {
+                    count.attachments++;
+                }
+                if (this.state.lastUsed.has(item.id) && this.state.lastUsed.get(item.id)! > recentThreshold) {
+                    count.recent++;
+                }
+            }
+        }
+
+        return count;
+    }
+
     private _queuedSyncPromises = new Map<string, Promise<void>>();
     private _activeSyncPromises = new Map<string, Promise<void>>();
 
@@ -291,6 +412,10 @@ export class App {
     /** Save application state to persistent storage */
     async save() {
         await this.loaded;
+        if (!this.state.locked) {
+            await this.state.index.fromItems(this.state.vaults.flatMap(v => [...v.items]));
+        }
+
         await this.storage.save(this.state);
     }
 
@@ -319,15 +444,18 @@ export class App {
         // Save back to storage
         await this.storage.save(this.state);
 
-        // Try syncing account so user can unlock with new password in case it has changed
-        if (this.account) {
-            this.fetchAccount();
-        }
-
         this.loadBillingProvider();
 
         // Notify state change
         this.publish();
+    }
+
+    async reload() {
+        const masterKey = this.account && this.account.masterKey;
+        await this.load();
+        if (masterKey) {
+            await this.unlockWithMasterKey(masterKey);
+        }
     }
 
     /**
@@ -357,6 +485,7 @@ export class App {
      * and vaults
      */
     async synchronize() {
+        this.setState({ syncing: true });
         await this.fetchAccount();
         await this.fetchOrgs();
         await this.syncVaults();
@@ -385,11 +514,11 @@ export class App {
     /**
      * Notifies all subscribers of a [[state]] change
      */
-    publish() {
+    publish = throttle(() => {
         for (const fn of this._subscriptions) {
             fn(this.state);
         }
-    }
+    }, 1000);
 
     /**
      * Updates the app [[state]]
@@ -420,13 +549,13 @@ export class App {
      */
 
     /** Request email verification for a given `email`. */
-    async requestEmailVerification(email: string, purpose: EmailVerificationPurpose = EmailVerificationPurpose.Signup) {
-        return this.api.requestEmailVerification(new RequestEmailVerificationParams({ email, purpose }));
+    async requestMFACode(email: string, purpose: MFAPurpose) {
+        return this.api.requestMFACode(new RequestMFACodeParams({ email, purpose }));
     }
 
     /** Complete email with the given `code` */
-    async completeEmailVerification(email: string, code: string) {
-        return this.api.completeEmailVerification(new CompleteEmailVerificationParams({ email, code }));
+    async retrieveMFAToken(email: string, code: string, purpose: MFAPurpose) {
+        return this.api.retrieveMFAToken(new RetrieveMFATokenParams({ email, code, purpose }));
     }
 
     /**
@@ -553,7 +682,8 @@ export class App {
             account: null,
             session: null,
             vaults: [],
-            orgs: []
+            orgs: [],
+            index: new Index()
         });
         await this.save();
     }
@@ -592,9 +722,7 @@ export class App {
         // Copy over secret properties so we don't have to
         // unlock the account object again.
         if (this.account) {
-            account.privateKey = this.account.privateKey;
-            account.signingKey = this.account.signingKey;
-            account.masterKey = this.account.masterKey;
+            account.copySecrets(this.account);
         }
 
         // Update and save state
@@ -634,8 +762,7 @@ export class App {
 
         // Copy over secret properties so we don't have to unlock the
         // account object again.
-        account.privateKey = this.account!.privateKey;
-        account.signingKey = this.account!.signingKey;
+        account.copySecrets(this.account!);
 
         // Update and save state
         this.setState({ account });
@@ -778,7 +905,11 @@ export class App {
         const key = base64ToBytes(await keyStoreGet("master_key_encryption_key"));
         await encryptedMasterKey.unlock(key);
         const masterKey = await encryptedMasterKey.getData();
-        await this.account!.unlockWithMasterKey(masterKey);
+        await this.unlockWithMasterKey(masterKey);
+    }
+
+    async unlockWithMasterKey(key: Uint8Array) {
+        await this.account!.unlockWithMasterKey(key);
         await this._unlocked();
     }
 
@@ -801,7 +932,7 @@ export class App {
     }
 
     isMainVault(vault: Vault) {
-        return vault && this.account && this.account.mainVault === vault.id;
+        return vault && this.account && this.account.mainVault.id === vault.id;
     }
 
     /** Create a new [[Vault]] */
@@ -815,6 +946,8 @@ export class App {
         vault.name = name;
         vault.org = { id: org.id, name: org.name };
         vault = await this.api.createVault(vault);
+
+        await this.fetchOrg(org);
 
         await this.updateOrg(org.id, async (org: Org) => {
             groups.forEach(({ name, readonly }) => {
@@ -844,7 +977,7 @@ export class App {
     }
 
     /** Update [[Vault]] name and access (not the vaults contents) */
-    async updateVault(
+    async updateVaultAccess(
         /** Organization owning the vault */
         orgId: OrgID,
         /** The vault id */
@@ -856,6 +989,10 @@ export class App {
         /** Groups that should have access to the vault */
         groups: { name: string; readonly: boolean }[] = []
     ) {
+        if (!members.length && !groups.length) {
+            throw new Error("You have to assign at least one member or group!");
+        }
+
         await this.updateOrg(orgId, async (org: Org) => {
             // Update name (the name of the actual [[Vault]] name will be
             // updated in the background)
@@ -883,6 +1020,8 @@ export class App {
                 }
             }
         });
+
+        this.synchronize();
     }
 
     /** Commit changes to vault object and save locally */
@@ -899,8 +1038,8 @@ export class App {
     }
 
     /** Synchronize the given [[Vault]] */
-    async syncVault(vault: { id: VaultID }, transform?: (vault: Vault) => any): Promise<Vault> {
-        return this._queueSync(vault, (vault: { id: VaultID }) => this._syncVault(vault, transform));
+    async syncVault(vault: { id: VaultID; name?: string; revision?: string }): Promise<Vault> {
+        return this._queueSync(vault, (vault: { id: VaultID }) => this._syncVault(vault));
     }
 
     /** Synchronize all vaults the current user has access to. */
@@ -910,30 +1049,225 @@ export class App {
         }
 
         // Sync private vault
-        const promises = [this.syncVault({ id: this.account.mainVault })] as Promise<any>[];
+        const promises = [this.syncVault(this.account.mainVault)] as Promise<any>[];
 
         // Sync vaults assigned to through organizations
         for (const org of this.state.orgs) {
             // Sync all vaults for this organization
-            for (const id of org.getVaultsForMember(this.account)) {
-                promises.push(this.syncVault({ id }));
+            for (const vault of org.getVaultsForMember(this.account)) {
+                promises.push(this.syncVault(vault));
             }
         }
 
         // clean up vaults the user no longer has access to
-        const removeVaults: string[] = [];
+        const removeVaults = new Set<VaultID>();
         for (const vault of this.state.vaults) {
             const org = vault.org && this.getOrg(vault.org.id);
-            if (vault.id !== this.account.mainVault && (!org || !org.canRead(vault, this.account))) {
-                removeVaults.push(vault.id);
+            if (
+                vault.id !== this.account.mainVault.id &&
+                (!org || !org.vaults.find(v => v.id === vault.id) || !org.canRead(vault, this.account))
+            ) {
+                removeVaults.add(vault.id);
             }
         }
 
         await this.setState({
-            vaults: this.state.vaults.filter(v => !removeVaults.includes(v.id))
+            vaults: this.state.vaults.filter(v => !removeVaults.has(v.id))
         });
 
         await Promise.all(promises);
+    }
+
+    async fetchVault({ id, revision }: { id: VaultID; revision?: string }): Promise<Vault | null> {
+        if (!this.account) {
+            console.error("need to be logged in to fetch vault!");
+            return null;
+        }
+
+        let localVault = this.getVault(id);
+
+        if (localVault && revision && localVault.revision === revision) {
+            return localVault;
+        }
+
+        let remoteVault: Vault | null = null;
+        let result: Vault;
+
+        try {
+            // Fetch and unlock remote vault
+            remoteVault = await this.api.getVault(id);
+        } catch (e) {
+            if (localVault && e.code !== ErrorCode.FAILED_CONNECTION) {
+                localVault.error = e;
+            }
+        }
+
+        if (!remoteVault) {
+            return null;
+        }
+
+        try {
+            await remoteVault.unlock(this.account);
+        } catch (e) {
+            if (localVault) {
+                localVault.error = e;
+                return localVault;
+            } else {
+                remoteVault.error = e;
+                this.putVault(remoteVault);
+                return remoteVault;
+            }
+        }
+
+        // Merge changes
+        if (localVault) {
+            result = this.getVault(id)!;
+            try {
+                await result.unlock(this.account);
+                result.merge(remoteVault);
+            } catch (e) {
+                result = remoteVault;
+            }
+        } else {
+            result = remoteVault;
+        }
+
+        // Migrate favorites from "old" favoriting mechanism
+        for (const item of result.items) {
+            if (item.favorited && item.favorited.includes(this.account.id)) {
+                this.account.favorites.add(item.id);
+                item.favorited = item.favorited.filter(acc => acc !== this.account!.id);
+                result.items.update(item);
+            }
+        }
+
+        await this.saveVault(result);
+
+        return result;
+    }
+
+    async updateVault({ id }: { id: VaultID }, tries = 0): Promise<Vault | null> {
+        if (!this.account) {
+            throw "need to be logged in to update vault!";
+        }
+
+        let vault = this.getVault(id)!;
+        const org = vault.org && this.getOrg(vault.org.id);
+
+        const accessors = (org ? org.getAccessors(vault) : [this.account]) as OrgMember[];
+
+        const accessorsChanged =
+            vault.accessors.length !== accessors.length ||
+            accessors.some(a => vault.accessors.some(b => a.id !== b.id));
+
+        if ((org && org.isSuspended(this.account)) || (!vault.items.hasChanges && !accessorsChanged)) {
+            // No changes - skipping update
+            return vault;
+        }
+
+        const updateStarted = new Date();
+        vault = vault.clone();
+
+        vault.items.clearChanges();
+        await vault.commit();
+
+        try {
+            // // Make sure the organization revision matches the one the vault is based on
+            if (vault.org && (!org || org.revision !== vault.org.revision)) {
+                if (tries > 3) {
+                    throw new Err(
+                        ErrorCode.OUTDATED_REVISION,
+                        $l(
+                            "Local changes to this vault could not be synchronized because there was a problem " +
+                                "retrieving information for this vaults organization. If this problem persists " +
+                                "please contact customer support!"
+                        )
+                    );
+                }
+
+                // Get the latest organization and vault info, then try again
+                await this.fetchOrg({ id: vault.org.id });
+                await this.fetchVault({ id });
+                return this.updateVault(vault, tries + 1);
+            }
+        } catch (e) {
+            this.getVault(vault.id)!.error = e;
+            return null;
+        }
+
+        // Update accessors
+        if (org) {
+            try {
+                if (org.frozen) {
+                    throw new Err(
+                        ErrorCode.ORG_FROZEN,
+                        $l("Synching local changes failed because the organization this vault belongs to is frozen.")
+                    );
+                }
+
+                if (!org.canWrite(vault, this.account)) {
+                    throw new Err(
+                        ErrorCode.INSUFFICIENT_PERMISSIONS,
+                        $l("Synching local changes failed because you don't have write permissions for this vault.")
+                    );
+                }
+
+                // Look up which members should have access to this vault
+                const accessors = org.getAccessors(vault);
+
+                // Verify member details
+                await this.account.verifyOrg(org);
+                await org.verifyAll(accessors);
+
+                // Update accessors
+                await vault.updateAccessors(accessors);
+            } catch (e) {
+                this.getVault(vault.id)!.error = e;
+                return null;
+            }
+        } else {
+            await vault.updateAccessors([this.account]);
+        }
+
+        // Push updated vault object to [[Server]]
+        try {
+            vault = await this.api.updateVault(vault);
+            await vault.unlock(this.account);
+
+            const existing = this.getVault(vault.id)!;
+            existing.items.clearChanges(updateStarted);
+
+            existing.merge(vault);
+
+            this.putVault(existing);
+
+            if (org) {
+                org.revision = vault.org!.revision!;
+                org.vaults.find(v => v.id === vault!.id)!.revision = vault.revision;
+                this.putOrg(org);
+                this.account.orgs.find(o => o.id === org.id)!.revision = org.revision;
+            } else {
+                this.account.mainVault.revision = vault.revision;
+            }
+
+            await this.save();
+
+            return existing;
+        } catch (e) {
+            // The server will reject the update if the vault revision does
+            // not match the current revision on the server, in which case we'll
+            // have to fetch the current vault version and try again.
+            if (e.code === ErrorCode.OUTDATED_REVISION) {
+                await this.fetchVault({ id });
+                return this.updateVault({ id });
+            }
+
+            if (e.code !== ErrorCode.FAILED_CONNECTION) {
+                this.getVault(vault.id)!.error = e;
+            }
+
+            return vault;
+        }
     }
 
     /** Whether the current user has write permissions to the given `vault`. */
@@ -947,87 +1281,9 @@ export class App {
         return org.canWrite(vault, this.account!);
     }
 
-    private async _syncVault({ id }: { id: VaultID }, transform?: (vault: Vault) => any): Promise<Vault | null> {
-        if (!this.account || this.account.locked) {
-            return null;
-        }
-
-        const localVault = this.getVault(id);
-        let remoteVault: Vault;
-        let result: Vault;
-
-        try {
-            // Fetch and unlock remote vault
-            remoteVault = await this.api.getVault(id);
-            if (remoteVault.encryptedData) {
-                await remoteVault.unlock(this.account);
-            }
-        } catch (e) {
-            return null;
-        }
-
-        // Merge changes
-        if (localVault) {
-            result = localVault.clone();
-            await result.unlock(this.account);
-            result.merge(remoteVault);
-        } else {
-            result = remoteVault;
-        }
-
-        const org = result.org && this.getOrg(result.org.id);
-
-        // Skip update if
-        // - Member does not have write access to vault
-        // - Vault belongs to an org and account membership is suspended
-        // - Vault belongs to an org with "frozen" status
-        if (
-            !org ||
-            (!org.frozen &&
-                org.getMember(this.account)!.role !== OrgRole.Suspended &&
-                org.canWrite(result, this.account))
-        ) {
-            // Update vault accessors
-            if (org) {
-                // Look up which members should have access to this vault
-                const accessors = org.getAccessors(result);
-
-                // Verify member details
-                await this.account.verifyOrg(org);
-                await org.verifyAll(accessors);
-
-                // Update accessors
-                await result.updateAccessors(accessors);
-            } else {
-                await result.updateAccessors([this.account]);
-            }
-
-            // Commit changes done during merge
-            await result.commit();
-
-            // Apply any additional changes
-            if (transform) {
-                transform(result);
-            }
-
-            // Push updated vault object to [[Server]]
-            try {
-                await this.api.updateVault(result);
-            } catch (e) {
-                // The server will reject the update if the vault revision does
-                // not match the current revision on the server, in which case we'll
-                // have to fetch the current vault version and try again.
-                if (e.code === ErrorCode.OUTDATED_REVISION) {
-                    return this._syncVault({ id });
-                }
-                throw e;
-            }
-        }
-
-        // Save vault locally
-        await this.saveVault(result);
-
-        return result;
+    private async _syncVault(vault: { id: VaultID; revision?: string }): Promise<Vault | null> {
+        await this.fetchVault(vault);
+        return this.updateVault(vault);
     }
 
     /**
@@ -1049,87 +1305,132 @@ export class App {
     }
 
     /** Adds a number of `items` to the given `vault` */
-    async addItems(items: VaultItem[], vault: Vault = this.mainVault!) {
+    async addItems(items: VaultItem[], { id }: { id: VaultID }) {
+        const vault = this.getVault(id)!;
         vault.items.update(...items);
         await this.saveVault(vault);
         this.syncVault(vault);
     }
 
     /** Creates a new [[VaultItem]] */
-    async createItem(name: string, vault: Vault = this.mainVault!, fields?: Field[], tags?: Tag[]): Promise<VaultItem> {
-        fields = fields || [
-            { name: $l("Username"), value: "", type: "username" },
-            { name: $l("Password"), value: "", type: "password" },
-            { name: $l("URL"), value: "", type: "url" }
-        ];
+    async createItem(name: string, vault: { id: VaultID }, fields?: Field[], tags?: Tag[]): Promise<VaultItem> {
         const item = await createVaultItem(name || "", fields, tags);
         if (this.account) {
             item.updatedBy = this.account.id;
         }
-        this.addItems([item], vault);
+
+        await this.addItems([item], vault);
+
         return item;
     }
 
     /** Update a given [[VaultItem]]s name, fields, tags and attachments */
     async updateItem(
-        vault: Vault,
         item: VaultItem,
         upd: {
             name?: string;
             fields?: Field[];
             tags?: Tag[];
             attachments?: AttachmentInfo[];
-            favorite?: boolean;
-            lastUsed?: Date;
         }
     ) {
-        const account = this.account!;
-
-        let favorited = new Set(item.favorited);
-
-        if (typeof upd.favorite === "boolean") {
-            upd.favorite ? favorited.add(account.id) : favorited.delete(account.id);
-        }
-
-        vault.items.update({ ...item, ...upd, updatedBy: this.account!.id, favorited: [...favorited] });
-        this.saveVault(vault);
+        const { vault } = this.getItem(item.id)!;
+        vault.items.update(new VaultItem({ ...item, ...upd, updatedBy: this.account!.id }));
+        await this.saveVault(vault);
         await this.syncVault(vault);
     }
 
+    async toggleFavorite(id: VaultItemID, favorite: boolean) {
+        await this.updateAccount(acc => acc.toggleFavorite(id, favorite));
+    }
+
+    async updateLastUsed(item: VaultItem) {
+        this.state.lastUsed.set(item.id, new Date());
+        this.publish();
+    }
+
     /** Delete a number of `items` */
-    async deleteItems(items: { item: VaultItem; vault: Vault }[]) {
+    async deleteItems(items: VaultItem[]) {
         const attachments: AttachmentInfo[] = [];
 
         // Group items by vault
         const grouped = new Map<Vault, VaultItem[]>();
         for (const item of items) {
-            if (!grouped.has(item.vault)) {
-                grouped.set(item.vault, []);
+            const { vault } = this.getItem(item.id)!;
+
+            if (!grouped.has(vault)) {
+                grouped.set(vault, []);
             }
-            grouped.get(item.vault)!.push(item.item);
-            attachments.push(...item.item.attachments);
+
+            grouped.get(vault)!.push(item);
+            attachments.push(...item.attachments);
         }
 
+        const promises: Promise<void>[] = [];
+
         // Delete all attachments for this item
-        await Promise.all(attachments.map(att => this.api.deleteAttachment(new DeleteAttachmentParams(att))));
+        promises.push(...attachments.map(att => this.api.deleteAttachment(new DeleteAttachmentParams(att))));
 
         // Remove items from their respective vaults
         for (const [vault, items] of grouped.entries()) {
-            vault.items.remove(...items);
-            this.saveVault(vault);
-            await this.syncVault(vault);
+            promises.push(
+                (async () => {
+                    vault.items.remove(...items);
+                    await this.saveVault(vault);
+                    await this.syncVault(vault);
+                })()
+            );
         }
+
+        await Promise.all(promises);
     }
 
     /** Move `items` from their current vault to the `target` vault */
-    async moveItems(items: { item: VaultItem; vault: Vault }[], target: Vault) {
-        if (items.some(item => !!item.item.attachments.length)) {
+    async moveItems(items: VaultItem[], target: Vault) {
+        if (items.some(item => !!item.attachments.length)) {
             throw "Items with attachments cannot be moved!";
         }
-        const newItems = await Promise.all(items.map(async i => ({ ...i.item, id: await uuid() })));
+        const newItems = await Promise.all(items.map(async item => new VaultItem({ ...item, id: await uuid() })));
         await this.addItems(newItems, target);
         await this.deleteItems(items);
         return newItems;
+    }
+
+    getItemsForHost(host: string) {
+        const items: { vault: Vault; item: VaultItem }[] = [];
+        for (const vault of this.vaults) {
+            for (const item of vault.items) {
+                if (
+                    item.fields.some(field => {
+                        if (field.type !== "url") {
+                            return false;
+                        }
+
+                        // Try to parse host from url. If field value is not a valid URL,
+                        // assume its the bare host name
+                        let h = field.value;
+                        try {
+                            h = new URL(field.value).host;
+                        } catch (e) {}
+
+                        // If host doesn't match exactly, try with/without "www."
+                        return h === host || (host.startsWith("www.") ? host.slice(4) === h : "www." + host === h);
+                    })
+                ) {
+                    items.push({ vault, item });
+                }
+            }
+        }
+        return items;
+    }
+
+    getItemsForUrl(url: string) {
+        try {
+            const { host } = new URL(url);
+            return this.getItemsForHost(host);
+        } catch (e) {
+            return [];
+        }
     }
 
     /*
@@ -1159,8 +1460,7 @@ export class App {
         await org.initialize(this.account!);
         org = await this.api.updateOrg(org);
         await this.fetchAccount();
-        await this.fetchOrg(org.id);
-        return this.getOrg(org.id)!;
+        return this.fetchOrg(org);
     }
 
     /** Fetch all organizations the current account is a member of */
@@ -1170,17 +1470,22 @@ export class App {
         }
 
         try {
-            await Promise.all(this.account.orgs.map(id => this.fetchOrg(id)));
+            await Promise.all(this.account.orgs.map(org => this.fetchOrg(org)));
         } catch (e) {}
 
         // Remove orgs that the account is no longer a member of
-        this.setState({ orgs: this.state.orgs.filter(org => this.account!.orgs.includes(org.id)) });
+        this.setState({ orgs: this.state.orgs.filter(org => this.account!.orgs.some(o => o.id === org.id)) });
     }
 
     /** Fetch the [[Org]]anization object with the given `id` */
-    async fetchOrg(id: OrgID) {
-        const org = await this.api.getOrg(id);
+    async fetchOrg({ id, revision }: { id: OrgID; revision?: string }) {
         const existing = this.getOrg(id);
+
+        if (existing && existing.revision === revision) {
+            return existing;
+        }
+
+        const org = await this.api.getOrg(id);
 
         // Verify that the updated organization object has a `minMemberUpdated`
         // property equal to or higher than the previous (local) one.
@@ -1211,7 +1516,7 @@ export class App {
             // If organizaton has been updated since last fetch,
             // get the current version and then retry
             if (e.code === ErrorCode.OUTDATED_REVISION) {
-                await this.fetchOrg(id);
+                await this.fetchOrg({ id });
                 return this.updateOrg(id, transform);
             } else {
                 throw e;
@@ -1330,9 +1635,10 @@ export class App {
      * Create a new [[Invite]]
      */
     async createInvites({ id }: Org, emails: string[], purpose?: InvitePurpose) {
-        const invites: Invite[] = [];
+        let invites: Invite[] = [];
         await this.updateOrg(id, async (org: Org) => {
             await org.unlock(this.account!);
+            invites = [];
             for (const email of emails) {
                 const invite = new Invite(email, purpose);
                 await invite.initialize(org, this.account!);
@@ -1409,27 +1715,44 @@ export class App {
     async createAttachment(itemId: VaultItemID, file: File, name?: string): Promise<Attachment> {
         const { vault, item } = this.getItem(itemId)!;
 
-        let att = new Attachment({ vault: vault.id });
+        const att = new Attachment({ vault: vault.id });
         await att.fromFile(file);
         if (name) {
             att.name = name;
         }
-        att = await this.api.createAttachment(att);
 
-        (async () => {
-            await att.uploadProgress!.completed;
-            this.updateItem(vault, item, { attachments: [...item.attachments, att.info] });
-        })();
+        const promise = this.api.createAttachment(att);
+
+        att.uploadProgress = promise.progress;
+
+        promise.then(id => {
+            att.id = id;
+            this.updateItem(item, { attachments: [...item.attachments, att.info] });
+            promise.progress!.complete();
+        });
 
         return att;
     }
 
     async downloadAttachment(att: AttachmentInfo) {
-        return this.api.getAttachment(new GetAttachmentParams(att));
+        const attachment = new Attachment(att);
+
+        const promise = this.api.getAttachment(new GetAttachmentParams({ id: att.id, vault: att.vault }));
+
+        attachment.downloadProgress = promise.progress;
+
+        promise.then(att => {
+            attachment.fromRaw(att.toRaw());
+            attachment.type = att.type;
+            attachment.name = att.name;
+            promise.progress!.complete();
+        });
+
+        return attachment;
     }
 
     async deleteAttachment(itemId: VaultItemID, att: Attachment | AttachmentInfo): Promise<void> {
-        const { vault, item } = this.getItem(itemId)!;
+        const { item } = this.getItem(itemId)!;
         try {
             await this.api.deleteAttachment(new DeleteAttachmentParams(att));
         } catch (e) {
@@ -1437,7 +1760,7 @@ export class App {
                 throw e;
             }
         }
-        await this.updateItem(vault, item, { attachments: item.attachments.filter(a => a.id !== att.id) });
+        await this.updateItem(item, { attachments: item.attachments.filter(a => a.id !== att.id) });
     }
 
     /**
@@ -1449,7 +1772,7 @@ export class App {
     async updateBilling(params: UpdateBillingParams) {
         params.provider = (this.state.billingProvider && this.state.billingProvider.type) || "";
         await this.api.updateBilling(params);
-        params.org ? await this.fetchOrg(params.org) : await this.fetchAccount();
+        params.org ? await this.fetchOrg({ id: params.org }) : await this.fetchAccount();
     }
 
     async loadBillingProvider() {
@@ -1509,7 +1832,15 @@ export class App {
 
     private async _unlocked() {
         // Unlock all vaults
-        await Promise.all(this.state.vaults.map(vault => vault.unlock(this.account!)));
+        await Promise.all(
+            this.state.vaults.map(async vault => {
+                try {
+                    await vault.unlock(this.account!);
+                } catch (e) {
+                    vault.error = e;
+                }
+            })
+        );
 
         // Notify state change
         this.publish();

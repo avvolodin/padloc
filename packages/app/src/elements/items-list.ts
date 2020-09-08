@@ -1,4 +1,4 @@
-import { VaultItem, Field, Tag, FIELD_DEFS } from "@padloc/core/src/item";
+import { VaultItem, Field, Tag } from "@padloc/core/src/item";
 import { Vault, VaultID } from "@padloc/core/src/vault";
 import { translate as $l } from "@padloc/locale/src/translate";
 import { debounce, wait, escapeRegex } from "@padloc/core/src/util";
@@ -23,9 +23,9 @@ import "./totp";
 interface ListItem {
     item: VaultItem;
     vault: Vault;
-    section: string;
-    firstInSection: boolean;
-    lastInSection: boolean;
+    section?: string;
+    firstInSection?: boolean;
+    lastInSection?: boolean;
     warning?: boolean;
 }
 
@@ -63,6 +63,9 @@ export class ItemsList extends StateMixin(View) {
     recent: boolean = false;
 
     @property()
+    host: boolean = false;
+
+    @property()
     private _listItems: ListItem[] = [];
     // @property()
     // private _firstVisibleIndex: number = 0;
@@ -97,6 +100,7 @@ export class ItemsList extends StateMixin(View) {
     @observe("favorites")
     @observe("attachments")
     @observe("recent")
+    @observe("host")
     async stateChanged() {
         // Clear items from selection that are no longer in list (due to filtering)
         for (const id of this._multiSelect.keys()) {
@@ -282,6 +286,15 @@ export class ItemsList extends StateMixin(View) {
                 flex: 1;
                 border-radius: 8px;
                 max-width: calc(60%);
+                opacity: 0.999;
+            }
+
+            .item-field.dragging {
+                background: var(--color-tertiary);
+            }
+
+            .item-field.dragging::after {
+                background: none;
             }
 
             .item-field > * {
@@ -311,6 +324,7 @@ export class ItemsList extends StateMixin(View) {
             .item-field-label {
                 padding: 4px 6px;
                 pointer-events: none;
+                min-width: 0;
             }
 
             .item-field-name {
@@ -466,6 +480,7 @@ export class ItemsList extends StateMixin(View) {
                     .tag=${this.tag}
                     .favorites=${this.favorites}
                     .recent=${this.recent}
+                    .host=${this.host}
                     .attachments=${this.attachments}
                     .searching=${this._filterShowing}
                 ></pl-items-filter>
@@ -607,7 +622,7 @@ export class ItemsList extends StateMixin(View) {
             { type: "destructive" }
         );
         if (confirmed) {
-            await app.deleteItems(selected);
+            await app.deleteItems(selected.map(i => i.item));
             this.cancelMultiSelect();
         }
     }
@@ -650,13 +665,19 @@ export class ItemsList extends StateMixin(View) {
         }
     }
 
-    private _copyField({ vault, item }: ListItem, index: number, e: Event) {
+    private _copyField({ item }: ListItem, index: number, e: Event) {
         e.stopPropagation();
         setClipboard(item, item.fields[index]);
         const fieldEl = e.target as HTMLElement;
         fieldEl.classList.add("copied");
         setTimeout(() => fieldEl.classList.remove("copied"), 1000);
-        app.updateItem(vault, item, { lastUsed: new Date() });
+        app.updateLastUsed(item);
+        this.dispatch("field-clicked", { item, index });
+    }
+
+    private async _dragFieldStart({ item }: ListItem, index: number, event: DragEvent) {
+        this.dispatch("field-dragged", { item, index, event });
+        return true;
     }
 
     private _openAttachment(a: AttachmentInfo, item: VaultItem, e: MouseEvent) {
@@ -665,34 +686,39 @@ export class ItemsList extends StateMixin(View) {
     }
 
     private _getItems(): ListItem[] {
-        const { vault: vaultId, tag, favorites, attachments, recent } = this;
+        const { vault: vaultId, tag, favorites, attachments, recent, host } = this;
         const filter = (this._filterInput && this._filterInput.value) || "";
         const recentThreshold = new Date(Date.now() - app.settings.recentLimit * 24 * 60 * 60 * 1000);
 
         let items: ListItem[] = [];
 
-        for (const vault of this.state.vaults) {
-            // Filter by vault
-            if (vaultId && vault.id !== vaultId) {
-                continue;
-            }
+        if (host) {
+            items = this.app.getItemsForHost(this.app.state.currentHost);
+        } else {
+            for (const vault of this.state.vaults) {
+                // Filter by vault
+                if (vaultId && vault.id !== vaultId) {
+                    continue;
+                }
 
-            for (const item of vault.items) {
-                if (
-                    // filter by tag
-                    (!tag || item.tags.includes(tag)) &&
-                    (!favorites || (item.favorited && item.favorited.includes(app.account!.id))) &&
-                    (!attachments || !!item.attachments.length) &&
-                    (!recent || item.lastUsed > recentThreshold) &&
-                    filterByString(filter || "", item)
-                ) {
-                    items.push({
-                        vault,
-                        item,
-                        section: "",
-                        firstInSection: false,
-                        lastInSection: false
-                    });
+                for (const item of vault.items) {
+                    if (
+                        // filter by tag
+                        (!tag || item.tags.includes(tag)) &&
+                        (!favorites || app.account!.favorites.has(item.id)) &&
+                        (!attachments || !!item.attachments.length) &&
+                        (!recent ||
+                            (app.state.lastUsed.has(item.id) && app.state.lastUsed.get(item.id)! > recentThreshold)) &&
+                        filterByString(filter || "", item)
+                    ) {
+                        items.push({
+                            vault,
+                            item,
+                            section: "",
+                            firstInSection: false,
+                            lastInSection: false
+                        });
+                    }
                 }
             }
         }
@@ -741,7 +767,7 @@ export class ItemsList extends StateMixin(View) {
             });
         }
 
-        if (item.favorited && item.favorited.includes(app.account!.id)) {
+        if (app.account!.favorites.has(item.id)) {
             tags.push({
                 name: "",
                 icon: "favorite",
@@ -750,7 +776,7 @@ export class ItemsList extends StateMixin(View) {
         }
 
         return html`
-            <div class="item" ?selected=${item.id === this.selected} @click=${() => this.selectItem(li)}>
+            <div class="item" ?selected=${item.id === this.selected} @click="${() => this.selectItem(li)}}">
                 ${cache(
                     this.multiSelect
                         ? html`
@@ -793,12 +819,16 @@ export class ItemsList extends StateMixin(View) {
 
                     <div class="item-fields">
                         ${item.fields.map((f: Field, i: number) => {
-                            const fieldDef = FIELD_DEFS[f.type] || FIELD_DEFS.text;
                             return html`
-                                <div class="item-field tap" @click=${(e: MouseEvent) => this._copyField(li, i, e)}>
+                                <div
+                                    class="item-field tap"
+                                    @click=${(e: MouseEvent) => this._copyField(li, i, e)}
+                                    draggable="true"
+                                    @dragstart=${(e: DragEvent) => this._dragFieldStart(li, i, e)}
+                                >
                                     <div class="item-field-label">
                                         <div class="item-field-name">
-                                            <pl-icon icon="${fieldDef.icon}"></pl-icon>
+                                            <pl-icon icon="${f.icon}"></pl-icon>
                                             ${f.name || $l("Unnamed")}
                                         </div>
                                         ${f.type === "totp"
@@ -807,7 +837,7 @@ export class ItemsList extends StateMixin(View) {
                                               `
                                             : html`
                                                   <div class="item-field-value">
-                                                      ${fieldDef.format ? fieldDef.format(f.value, true) : f.value}
+                                                      ${f.format(true)}
                                                   </div>
                                               `}
                                     </div>

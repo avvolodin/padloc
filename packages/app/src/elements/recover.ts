@@ -1,6 +1,6 @@
 import { translate as $l } from "@padloc/locale/src/translate";
 import { ErrorCode } from "@padloc/core/src/error";
-import { EmailVerificationPurpose } from "@padloc/core/src/email-verification";
+import { MFAPurpose } from "@padloc/core/src/mfa";
 import { app, router } from "../globals";
 import { element, html, css, property, query } from "./base";
 import { StartForm } from "./start-form";
@@ -40,12 +40,12 @@ export class Recover extends StartForm {
             h1 {
                 display: block;
                 text-align: center;
-                margin: 30px;
+                margin: 10px;
             }
 
             .title {
                 width: 300px;
-                margin: 30px auto;
+                margin: 10px auto 30px auto;
                 font-size: var(--font-size-small);
                 font-weight: bold;
                 letter-spacing: 0.5px;
@@ -76,6 +76,26 @@ export class Recover extends StartForm {
                 background: transparent;
                 border: none;
             }
+
+            .back-button {
+                display: flex;
+                align-items: center;
+                padding: 4px 8px 4px 4px;
+                background: transparent;
+                align-self: flex-start;
+                margin-top: 20px;
+            }
+
+            .back-button:not:hover {
+                opacity: 0.8;
+            }
+
+            .back-button pl-icon {
+                width: 15px;
+                height: 15px;
+                margin-right: 4px;
+                font-size: 0.8em;
+            }
         `
     ];
 
@@ -84,6 +104,13 @@ export class Recover extends StartForm {
             <div flex></div>
 
             <form>
+                <button class="back-button tap animate" type="button" @click=${() => router.go("login")}>
+                    <pl-icon icon="backward"></pl-icon>
+                    <div>
+                        ${$l("Back To Login")}
+                    </div>
+                </button>
+
                 <h1 class="animate">${$l("Recover Account")}</h1>
 
                 <div class="title animate">
@@ -215,7 +242,7 @@ export class Recover extends StartForm {
             }
         }
 
-        await app.requestEmailVerification(email, EmailVerificationPurpose.Recover);
+        await app.requestMFACode(email, MFAPurpose.Recover);
 
         return this._recover(email, password);
     }
@@ -233,9 +260,9 @@ export class Recover extends StartForm {
                 confirmLabel: "Submit",
                 validate: async (code: string) => {
                     try {
-                        return await app.completeEmailVerification(email, code);
+                        return await app.retrieveMFAToken(email, code, MFAPurpose.Recover);
                     } catch (e) {
-                        if (e.code === ErrorCode.EMAIL_VERIFICATION_TRIES_EXCEEDED) {
+                        if (e.code === ErrorCode.MFA_TRIES_EXCEEDED) {
                             alert($l("Maximum number of tries exceeded! Please resubmit and try again!"), {
                                 type: "warning"
                             });
@@ -253,9 +280,10 @@ export class Recover extends StartForm {
         }
 
         try {
-            await app.recoverAccount({ email, password, verify });
+            await app.recoverAccount({ email, password, verify: verify.token });
             this._submitButton.success();
             await alert($l("Account recovery successful!"), { type: "success" });
+            router.go("login");
         } catch (e) {
             this._submitButton.fail();
             throw e;

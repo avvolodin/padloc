@@ -39,11 +39,12 @@ export class Router extends EventEmitter {
     }
 
     set params(params: { [prop: string]: string }) {
-        history.pushState(
+        history.replaceState(
             { historyIndex: this.history.length - 1 },
             "",
             this.basePath + this.path + "?" + new URLSearchParams(params).toString()
         );
+        this.dispatch("params-changed", { params });
     }
 
     get canGoBack() {
@@ -51,7 +52,16 @@ export class Router extends EventEmitter {
     }
 
     go(path: string, params?: { [prop: string]: string }, replace = false) {
-        const queryString = new URLSearchParams(params || this.params).toString();
+        params = params || this.params;
+
+        // Clean out properties with value undefined
+        for (const [key, value] of Object.entries(params)) {
+            if (typeof value === "undefined") {
+                delete params[key];
+            }
+        }
+
+        const queryString = new URLSearchParams(params).toString();
 
         if (path !== this.path || queryString !== window.location.search) {
             let url = this.basePath + path;

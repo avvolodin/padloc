@@ -1,6 +1,7 @@
 import { Platform, StubPlatform, DeviceInfo } from "@padloc/core/src/platform";
 import { bytesToBase64 } from "@padloc/core/src/encoding";
 import { WebCryptoProvider } from "./crypto";
+import { LocalStorage } from "./storage";
 
 const browserInfo = (async () => {
     const { UAParser } = await import(/* webpackChunkName: "ua-parser" */ "ua-parser-js");
@@ -13,6 +14,7 @@ export class WebPlatform extends StubPlatform implements Platform {
     private _qrCanvas: HTMLCanvasElement;
 
     crypto = new WebCryptoProvider();
+    storage = new LocalStorage();
 
     // Set clipboard text using `document.execCommand("cut")`.
     // NOTE: This only works in certain environments like Google Chrome apps with the appropriate permissions set
@@ -137,7 +139,7 @@ export class WebPlatform extends StubPlatform implements Platform {
 
     async saveFile(name: string, type: string, contents: Uint8Array) {
         const a = document.createElement("a");
-        a.href = `data:${type};base64,${bytesToBase64(contents)}`;
+        a.href = `data:${type};base64,${bytesToBase64(contents, false)}`;
         a.download = name;
         a.rel = "noopener";
         document.body.appendChild(a);
